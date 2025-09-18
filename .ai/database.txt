@@ -1,406 +1,190 @@
-Below is a practical, MVP-oriented **database structure** for Tomoro Bridging (Laravel 12 + Inertia v2). It prioritizes: **Upload → Transform/Map → Post to Accurate → Reconcile**. Names follow Laravel conventions; types assume MySQL/MariaDB (utf8mb4).
-
----
-
-# 1) Core Entities
-
-## 1.1 files
-
-Stores every uploaded file (CSV/XLSX only).
-
-* `id` (PK, BIGINT)
-* `type` (ENUM: `boh_purchase`, `bi_sales`, `bank_statement`)
-* `original_name` (VARCHAR 255)
-* `storage_path` (VARCHAR 255)
-* `size_bytes` (BIGINT, unsigned)
-* `rows_detected` (INT, unsigned, default 0)
-* `status` (ENUM: `uploaded`, `parsed`, `validated`, `committed`, `failed`)
-* `meta` (JSON) — headers, delimiter, detected date format, etc.
-* `created_by` (FK → users.id, nullable)
-* Timestamps, soft deletes
-  **Indexes**: `type`, `status`, `created_at`
-
-## 1.2 raw\_rows
-
-Immutable snapshot of the original rows per file.
-
-* `id` (PK)
-* `file_id` (FK → files.id, ON DELETE CASCADE)
-* `row_no` (INT, unsigned)
-* `row_data` (JSON) — 1:1 with CSV/XLSX header mapping
-* Timestamps
-  **Unique**: (`file_id`, `row_no`)
-  **Index**: `file_id`
-
-## 1.3 transformed\_rows
-
-Normalized rows after mapping & validation (ready for preview/posting).
-
-* `id` (PK)
-* `file_id` (FK → files.id)
-* `source_row_id` (FK → raw\_rows.id)
-* `normalized` (JSON) — canonical structure (see §§2–3)
-* `valid_flag` (BOOLEAN)
-* `errors` (JSON, nullable)
-* `hash` (CHAR(64)) — idempotency/materialized checksum
-* Timestamps
-  **Indexes**: `file_id`, `valid_flag`, `hash`
-
-## 1.4 batches
-
-Logical unit for committing to Accurate (idempotent).
-
-* `id` (PK)
-* `file_id` (FK → files.id)
-* `type` (ENUM: `purchase`, `sales`, `journal`)
-* `status` (ENUM: `ready`, `posting`, `partial_success`, `success`, `failed`)
-* `idempotency_key` (VARCHAR 64, unique)
-* `summary` (JSON) — counts, totals, channel breakdown, etc.
-* `created_by` (FK → users.id)
-* Timestamps
-  **Indexes**: `file_id`, `status`, `created_at`
-
-## 1.5 post\_results
-
-Trace of each API call to Accurate per logical document.
-
-* `id` (PK)
-* `batch_id` (FK → batches.id, ON DELETE CASCADE)
-* `endpoint` (VARCHAR 80) — e.g., `/sales-invoice`, `/purchase-order`, `/journal-entry`
-* `external_id` (VARCHAR 80, nullable) — returned doc id/number
-* `request_payload` (JSON)
-* `response_payload` (JSON, nullable)
-* `status` (ENUM: `success`, `error`)
-* `error_code` (VARCHAR 80, nullable)
-* `duration_ms` (INT, unsigned)
-* Timestamps
-  **Indexes**: `batch_id`, `status`, `external_id`
-
-## 1.6 audit\_logs
-
-Immutable audit trail.
-
-* `id` (PK)
-* `actor_id` (FK → users.id, nullable)
-* `action` (VARCHAR 100) — `upload`, `map.update`, `validate`, `batch.post`, etc.
-* `subject_type` (VARCHAR 100) — `File`, `Batch`, `Mapping`, `Integration`
-* `subject_id` (BIGINT, nullable)
-* `before` (JSON, nullable)
-* `after` (JSON, nullable)
-* `message` (TEXT, nullable)
-* `ip` (INET, nullable)
-* Timestamps
-  **Indexes**: (`subject_type`, `subject_id`), `created_at`
-
-## 1.7 scheduler\_jobs
-
-For retries, nightly syncs.
-
-* `id` (PK)
-* `job_type` (VARCHAR 80) — `retry_failed_posts`, `daily_resume`
-* `schedule_cron` (VARCHAR 40)
-* `state` (ENUM: `idle`, `running`, `paused`)
-* `last_run_at` (DATETIME, nullable)
-* `retry_count` (INT, unsigned, default 0)
-* `meta` (JSON)
-* Timestamps
-
----
-
-# 2) Purchases (BOH) — Canonical Fields
-
-### 2.1 purchase\_docs
-
-Header level (PO/GR/Invoice depending on posting rule).
-
-* `id` (PK)
-* `file_id` (FK → files.id)
-* `source_row_id` (FK → raw\_rows.id)
-* `doc_type` (ENUM: `po`, `gr`, `invoice`)
-* `doc_no` (VARCHAR 80) — from BOH if present
-* `doc_date` (DATE)
-* `supplier_code` (VARCHAR 80)
-* `warehouse_code` (VARCHAR 80)
-* `currency` (CHAR(3), default `IDR`)
-* `subtotal` (DECIMAL(18,2))
-* `tax_total` (DECIMAL(18,2))
-* `grand_total` (DECIMAL(18,2))
-* `status` (ENUM: `staged`, `posted`, `failed`)
-* `posting_ext_id` (VARCHAR 80, nullable)
-* `errors` (JSON, nullable)
-* Timestamps
-  **Indexes**: `doc_type`, `doc_no`, `status`, `file_id`
-
-### 2.2 purchase\_items
-
-* `id` (PK)
-* `purchase_doc_id` (FK → purchase\_docs.id, ON DELETE CASCADE)
-* `line_no` (INT)
-* `item_code` (VARCHAR 80) — mapped Accurate item
-* `item_name_src` (VARCHAR 255) — raw name for traceability
-* `uom` (VARCHAR 20, nullable)
-* `qty` (DECIMAL(18,4))
-* `unit_price` (DECIMAL(18,4))
-* `line_total` (DECIMAL(18,2))
-* `tax_code` (VARCHAR 20, nullable)
-* `meta` (JSON) — e.g., DO reference
-* Timestamps
-  **Indexes**: `purchase_doc_id`, (`item_code`, `uom`)
-
----
-
-# 3) Sales & Reconciliation (BI + Bank)
-
-### 3.1 sales\_docs
-
-Rollup per channel/date to post to Accurate (summary invoice/journal).
-
-* `id` (PK)
-* `file_id` (FK → files.id)
-* `channel_code` (VARCHAR 40) — e.g., `GOFOOD`, `GRABFOOD`, `SHOPEEFOOD`, `OFFLINE`
-* `sales_date` (DATE)
-* `gross_amount` (DECIMAL(18,2))
-* `commission_fee` (DECIMAL(18,2))
-* `ads_fee` (DECIMAL(18,2))
-* `net_amount` (DECIMAL(18,2))
-* `bank_in_amount` (DECIMAL(18,2), nullable)
-* `diff_amount` (DECIMAL(18,2)) — `net_amount - bank_in_amount`
-* `status` (ENUM: `staged`, `reconciled`, `posted`, `failed`)
-* `posting_ext_id` (VARCHAR 80, nullable)
-* `errors` (JSON, nullable)
-* Timestamps
-  **Indexes**: (`channel_code`, `sales_date`), `status`, `file_id`
-
-### 3.2 sales\_items
-
-Optional detail by menu/SKU (if posting itemized).
-
-* `id` (PK)
-* `sales_doc_id` (FK → sales\_docs.id)
-* `line_no` (INT)
-* `item_code` (VARCHAR 80) — mapped Accurate item
-* `item_name_src` (VARCHAR 255)
-* `qty` (DECIMAL(18,4))
-* `gross_amount` (DECIMAL(18,2))
-* `net_amount` (DECIMAL(18,2))
-* `meta` (JSON)
-* Timestamps
-
-### 3.3 bank\_rows
-
-Normalized bank statement lines.
-
-* `id` (PK)
-* `file_id` (FK → files.id)
-* `txn_date` (DATE)
-* `description` (VARCHAR 255)
-* `debit` (DECIMAL(18,2))
-* `credit` (DECIMAL(18,2))
-* `balance` (DECIMAL(18,2), nullable)
-* `channel_guess` (VARCHAR 40, nullable) — from mapping/patterns
-* `match_key` (VARCHAR 120, nullable) — hash for matching
-* `matched_sales_doc_id` (FK → sales\_docs.id, nullable)
-* `status` (ENUM: `unmatched`, `matched`, `ignored`)
-* `meta` (JSON)
-* Timestamps
-  **Indexes**: `txn_date`, `description`, `status`, `match_key`
-
----
-
-# 4) Master Mapping & Rules
-
-### 4.1 mapping\_columns
-
-Wizard mapping from external headers to canonical fields.
-
-* `id` (PK)
-* `source_context` (ENUM: `boh_purchase`, `bi_sales`, `bank_statement`)
-* `source_field` (VARCHAR 120)
-* `target_field` (VARCHAR 120) — e.g., `doc_date`, `supplier_code`, `gross_amount`
-* `pattern` (VARCHAR 255, nullable) — wildcard/regex
-* `confidence` (TINYINT unsigned) — 0–100
-* `is_active` (BOOLEAN)
-* `version` (INT, default 1)
-* `updated_by` (FK → users.id)
-* Timestamps
-  **Unique**: (`source_context`, `source_field`, `version`)
-  **Indexes**: `target_field`, `is_active`
-
-### 4.2 mapping\_items
-
-* `id` (PK)
-* `source_name` (VARCHAR 255) — raw item/alias
-* `item_code` (VARCHAR 80) — Accurate item
-* `uom` (VARCHAR 20, nullable)
-* `pattern` (VARCHAR 255, nullable) — wildcard/regex
-* `confidence` (TINYINT unsigned)
-* `is_active` (BOOLEAN)
-* Timestamps
-  **Indexes**: `source_name`, `item_code`, `pattern`
-
-### 4.3 mapping\_channels
-
-* `id` (PK)
-* `bank_description_pattern` (VARCHAR 255)
-* `channel_code` (VARCHAR 40)
-* `status` (ENUM: `active`, `pending`, `disabled`)
-* `confidence` (TINYINT unsigned)
-* `last_tested_at` (DATETIME, nullable)
-* Timestamps
-  **Indexes**: `channel_code`, `status`
-
-### 4.4 mapping\_coa
-
-* `id` (PK)
-* `domain` (ENUM: `sales`, `purchase`, `fee`, `ads`, `diff`, `cogs`, `inventory`, `tax`)
-* `channel_code` (VARCHAR 40, nullable) — if channel-specific
-* `rule_key` (VARCHAR 80) — e.g., `net_sales`, `commission`, `selisih_bank`
-* `account_code` (VARCHAR 40) — Accurate COA
-* `tax_code` (VARCHAR 20, nullable)
-* `rules` (JSON) — rounding, cut-off, etc.
-* `is_active` (BOOLEAN)
-* Timestamps
-  **Indexes**: (`domain`, `channel_code`, `rule_key`), `is_active`
-
-### 4.5 rules\_tolerance
-
-* `id` (PK)
-* `channel_code` (VARCHAR 40)
-* `date_lag_days` (TINYINT) — e.g., `1` for T↔T+1
-* `amount_tolerance` (DECIMAL(18,2)) — absolute
-* `percent_tolerance` (DECIMAL(5,2)) — %
-* `is_active` (BOOLEAN)
-* Timestamps
-
----
-
-# 5) Integration Settings
-
-### 5.1 integrations\_accurate
-
-* `id` (PK)
-* `display_name` (VARCHAR 120)
-* `base_url` (VARCHAR 255)
-* `database_id` (VARCHAR 40)
-* `api_key_enc` (TEXT) — encrypted
-* `timeout_sec` (INT, default 30)
-* `max_retries` (TINYINT, default 3)
-* `verify_ssl` (BOOLEAN, default true)
-* `quota_remain` (INT, nullable)
-* `last_health_ms` (INT, nullable)
-* Timestamps
-
----
-
-# 6) Canonical JSON shapes (stored in `transformed_rows.normalized`)
-
-## 6.1 Purchase row (BOH → PO/GR/Invoice)
-
-```json
-{
-  "doc_type": "po",
-  "doc_no": "BOH-123",
-  "doc_date": "2025-08-26",
-  "supplier_code": "SUP001",
-  "warehouse_code": "WH01",
-  "lines": [
-    {
-      "item_name_src": "SUSU UHT 1L",
-      "item_code": "SKU-001",
-      "uom": "PCS",
-      "qty": 24,
-      "unit_price": 15000,
-      "tax_code": "PPN"
-    }
-  ]
-}
-```
-
-## 6.2 Sales row (BI)
-
-```json
-{
-  "sales_date": "2025-08-26",
-  "channel_code": "GOFOOD",
-  "gross_amount": 10000000,
-  "commission_fee": 2000000,
-  "ads_fee": 50000,
-  "net_amount": 7950000
-}
-```
-
-## 6.3 Bank row
-
-```json
-{
-  "txn_date": "2025-08-27",
-  "description": "GOFOOD-MERCHANT-12345",
-  "debit": 0,
-  "credit": 7900000,
-  "channel_guess": "GOFOOD"
-}
-```
-
----
-
-# 7) Key Relations (Models)
-
-* `File` has many `RawRow`, `TransformedRow`, `Batch`, `PurchaseDoc`, `SalesDoc`, `BankRow`
-* `Batch` has many `PostResult`
-* `PurchaseDoc` has many `PurchaseItem`
-* `SalesDoc` has many `SalesItem`, and many `BankRow` (via reconciliation)
-* Mapping models (`MappingColumn`, `MappingItem`, `MappingChannel`, `MappingCoa`) are referenced during transform; not FK-enforced to maintain flexibility/versioning.
-
----
-
-# 8) Indices & Performance Notes
-
-* **Large tables**: `raw_rows`, `transformed_rows`, `bank_rows` — partition by `file_id` (optional) or ensure composite indexes on (`file_id`, `row_no`) and `valid_flag`.
-* **Idempotency**: compute a SHA-256 hash of key normalized fields per logical document and store in `transformed_rows.hash`; enforce uniqueness at the `batches`/posting layer.
-* **Posting throughput**: batch 50–100 documents per API call; write `post_results` per attempt.
-
----
-
-# 9) Minimal Migration Sketch (examples)
-
-```php
-// files
-Schema::create('files', function (Blueprint $t) {
-  $t->id();
-  $t->enum('type', ['boh_purchase','bi_sales','bank_statement']);
-  $t->string('original_name');
-  $t->string('storage_path');
-  $t->unsignedBigInteger('size_bytes');
-  $t->unsignedInteger('rows_detected')->default(0);
-  $t->enum('status',['uploaded','parsed','validated','committed','failed'])->index();
-  $t->json('meta')->nullable();
-  $t->foreignId('created_by')->nullable()->constrained('users');
-  $t->softDeletes();
-  $t->timestamps();
-});
-
-// raw_rows
-Schema::create('raw_rows', function (Blueprint $t) {
-  $t->id();
-  $t->foreignId('file_id')->constrained()->cascadeOnDelete();
-  $t->unsignedInteger('row_no');
-  $t->json('row_data');
-  $t->timestamps();
-  $t->unique(['file_id','row_no']);
-});
-```
-
-(Apply the same pattern for the remaining tables.)
-
----
-
-## Why this structure
-
-* **Staging → Canonical → Posting** isolates parsing/mapping from external APIs.
-* **Mapping* tables*\* support wildcard/regex + confidence for cost-efficient AI assist later.
-* **Auditability** via immutable `raw_rows` and `post_results` guarantees traceability.
-* **Performance**: all heavy operations are keyed by `file_id` and batched.
-
----
-
-If you want, I can generate **Laravel migration files + Eloquent models** for the above (namespaced and timestamped), aligned with your module folders (Purchases, Sales, Bank, Mapping).
+-- ========================================
+-- CORE FILES & LOGS
+-- ========================================
+CREATE TABLE files (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  type ENUM('boh_purchase','bi_sales','bank_statement','email_settlement','qpon_statement'),
+  original_name VARCHAR(255),
+  storage_path VARCHAR(255),
+  size_bytes BIGINT UNSIGNED,
+  rows_detected INT UNSIGNED DEFAULT 0,
+  status ENUM('uploaded','parsed','validated','committed','failed'),
+  meta JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NULL,
+  deleted_at TIMESTAMP NULL
+);
+
+CREATE TABLE raw_rows (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  file_id BIGINT,
+  row_no INT UNSIGNED,
+  row_data JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(file_id,row_no),
+  FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+
+CREATE TABLE audit_logs (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  actor_id BIGINT NULL,
+  action VARCHAR(100),
+  subject_type VARCHAR(100),
+  subject_id BIGINT NULL,
+  before_state JSON NULL,
+  after_state JSON NULL,
+  message TEXT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX(subject_type,subject_id),
+  INDEX(created_at)
+);
+
+-- ========================================
+-- PURCHASE (BOH)
+-- ========================================
+CREATE TABLE purchase_docs (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  file_id BIGINT,
+  doc_type ENUM('po','gr','invoice'),
+  doc_no VARCHAR(80),
+  doc_date DATE,
+  supplier_code VARCHAR(80),
+  warehouse_code VARCHAR(80),
+  currency CHAR(3) DEFAULT 'IDR',
+  subtotal DECIMAL(18,2),
+  tax_total DECIMAL(18,2),
+  grand_total DECIMAL(18,2),
+  status ENUM('staged','posted','failed'),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX(doc_no),
+  FOREIGN KEY (file_id) REFERENCES files(id)
+);
+
+CREATE TABLE purchase_items (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  purchase_doc_id BIGINT,
+  line_no INT,
+  item_code VARCHAR(80),
+  item_name_src VARCHAR(255),
+  uom VARCHAR(20),
+  qty DECIMAL(18,4),
+  unit_price DECIMAL(18,4),
+  line_total DECIMAL(18,2),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (purchase_doc_id) REFERENCES purchase_docs(id) ON DELETE CASCADE
+);
+
+-- ========================================
+-- SALES (POS/BI)
+-- ========================================
+CREATE TABLE sales_docs (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  file_id BIGINT,
+  channel_code VARCHAR(40),
+  sales_date DATE,
+  gross_amount DECIMAL(18,2),
+  fee_amount DECIMAL(18,2),
+  ads_amount DECIMAL(18,2),
+  net_amount DECIMAL(18,2),
+  qpon_adjustment DECIMAL(18,2) DEFAULT 0,
+  bank_in_amount DECIMAL(18,2) DEFAULT 0,
+  delta_amount DECIMAL(18,2) DEFAULT 0,
+  status ENUM('staged','matched','wait_qpon','diff','posted','failed'),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX(channel_code,sales_date),
+  FOREIGN KEY (file_id) REFERENCES files(id)
+);
+
+CREATE TABLE sales_items (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  sales_doc_id BIGINT,
+  line_no INT,
+  item_code VARCHAR(80),
+  item_name_src VARCHAR(255),
+  qty DECIMAL(18,4),
+  gross_amount DECIMAL(18,2),
+  net_amount DECIMAL(18,2),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (sales_doc_id) REFERENCES sales_docs(id) ON DELETE CASCADE
+);
+
+-- ========================================
+-- BANK
+-- ========================================
+CREATE TABLE bank_rows (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  file_id BIGINT,
+  txn_date DATE,
+  description VARCHAR(255),
+  descriptor_norm VARCHAR(255),
+  debit DECIMAL(18,2),
+  credit DECIMAL(18,2),
+  balance DECIMAL(18,2),
+  channel_guess VARCHAR(40),
+  match_key VARCHAR(120),
+  matched_sales_doc_id BIGINT NULL,
+  status ENUM('unmatched','matched','ignored'),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX(txn_date),
+  INDEX(description),
+  FOREIGN KEY (file_id) REFERENCES files(id)
+);
+
+-- ========================================
+-- QPON / PROMO
+-- ========================================
+CREATE TABLE promo_redemptions (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  business_date DATE,
+  branch_code VARCHAR(40),
+  channel_code VARCHAR(40),
+  amount_discount DECIMAL(18,2),
+  orders INT,
+  source ENUM('POS','EMAIL','MANUAL_REPORT'),
+  status ENUM('pending','confirmed','rejected'),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE qpon_statements (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  period_start DATE,
+  period_end DATE,
+  total_discount_reported DECIMAL(18,2),
+  total_reimbursed DECIMAL(18,2),
+  file_id BIGINT,
+  uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (file_id) REFERENCES files(id)
+);
+
+-- ========================================
+-- RECONCILIATION
+-- ========================================
+CREATE TABLE reason_codes (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(40) UNIQUE,
+  description VARCHAR(255)
+);
+
+CREATE TABLE recon_matches (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  sales_doc_id BIGINT,
+  bank_row_id BIGINT,
+  match_level ENUM('exact','amount_only','fuzzy'),
+  delta_amount DECIMAL(18,2),
+  reason_code VARCHAR(40),
+  status ENUM('matched','difference','pending'),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (sales_doc_id) REFERENCES sales_docs(id),
+  FOREIGN KEY (bank_row_id) REFERENCES bank_rows(id)
+);
+
+CREATE TABLE recon_exceptions (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  recon_match_id BIGINT,
+  severity ENUM('high','medium','low'),
+  action VARCHAR(80),
+  status ENUM('open','in_progress','resolved'),
+  assignee VARCHAR(80),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (recon_match_id) REFERENCES recon_matches(id)
+);

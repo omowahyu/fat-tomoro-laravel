@@ -1,84 +1,65 @@
-# Tomoro Bridging – Requirements (MVP)
-
-## Priority
-1. Data Upload (CSV/Excel support for BOH, BI, Bank)
-2. Accurate API Integration (Purchases, Sales, Journal)
-3. AI Implementation (Mapping Assist, Anomaly Detection – optional, cost-controlled)
+# FAT TOMORO BRIDGING — REQUIREMENTS
 
 ---
 
-## 1. Upload Module
-- Support: CSV & Excel files only (≤10MB).
-- Types:
-  - BOH (Purchases/Inventory: coffee, milk, etc.)
-  - BI Sales (Multi-channel)
-  - Bank Statements (optional for reconciliation)
-- Flow:
-  - User uploads → Parse & Normalize → Preview (first rows + summary) → Validate → Confirm Commit
-- Features:
-  - Auto-detect delimiter & encoding
-  - Mapping Wizard (column, item, channel)
-  - Validation (required fields, numeric ranges, duplicate detection)
+# `requirement.md`
 
-## 2. Accurate API Integration
-- Endpoints: Sales Invoice, Purchase Order/GR, Journal Entry
-- Mode: Batch posting with retries + idempotency keys
-- Rules:
-  - Sales: Gross → Nett (fees, ads deducted)
-  - Purchases: Map items to Inventory/COGS, include supplier, warehouse, tax
-  - Reconciliation: If mismatch, BI as source of truth, differences posted to “Selisih Bank” account
-- Audit: Log all API interactions (req/resp, status, errors)
+## 1. Purpose
 
-## 3. Mapping Engine
-- Column Mapping (external → internal field)
-- Item Mapping (string patterns → SKU/ItemID)
-- Channel Mapping (GoFood, GrabFood, etc.)
-- COA Mapping (Sales, Ads, Fee, COGS, Inventory, Selisih)
-- Bank Mapping (statement descriptions → channel/merchant)
-- CRUD UI with versioning & preview tester
-
-## 4. AI Implementation (Optional, Cost-Efficient)
-- Use AI only when rule-based mapping < confidence threshold
-- Scope:
-  - Suggest field mapping from file headers
-  - Fuzzy match item/product names
-  - Flag anomalies in reconciliation (spikes, negatives)
-- Guardrails:
-  - Token/sample limits (process first 20–50 rows only)
-  - Prefer OSS/local libs (rapidfuzz) → fallback to small/cheap APIs
-
-## 5. User Roles & Permissions
-- OPS: Upload & validate (cannot post to Accurate)
-- FAT PSM: Approve mappings, confirm posting
-- Admin: Manage mappings, integrations, scheduler, monitoring
-
-## 6. Non-Functional
-- Performance: Parse ≤3s per 1k rows
-- Reliability: Retry w/ exponential backoff, idempotent commits
-- Security: API key encryption, role-based access
-- Observability: Success rate, error rate, latency dashboards
-
-## 7. Data Model (MVP tables)
-- files(id, type, name, size, status, meta)
-- raw_rows(id, file_id, row_json)
-- mappings(id, type, source, target, confidence, rules)
-- transformed_rows(id, file_id, normalized_json, valid_flag, errors)
-- batches(id, file_id, status, idempotency_key)
-- post_results(id, batch_id, endpoint, status, response)
-- audit_logs(id, actor, action, details, timestamp)
-
-## 8. Implementation Plan
-- Sprint 1: Upload (CSV/XLSX parsing, preview, validation, mapping)
-- Sprint 2: Accurate API connector + posting rules
-- Sprint 3: Sales reconciliation (BI vs Bank), resume report
-- Sprint 4: AI suggestions (mapping assist, anomaly flagging)
-- Sprint 5: Bank API integration & system hardening
+Dokumen ini adalah **pengarah utama** untuk AI maupun tim developer dalam memahami kebutuhan proyek **FAT TOMORO Bridging**.
+Semua detail lanjutan disimpan di file terpisah agar konteks ringan dan modular.
 
 ---
 
-## Libraries (Laravel 12 + Inertia 2 React)
-- Use existing Laravel + Inertia upload handling
-- For CSV/XLSX: [maatwebsite/excel] (Laravel Excel) – confirm before install
-- For validation/mapping: native Laravel validation + custom mapping tables
-- For charts/tables (UI): shadcn/ui, recharts (already aligned with React setup)
-- For fuzzy search (optional AI-lite): [rapidfuzz] (confirm before install)
+## 2. File Reference & Usage
+
+* **`project_requirement.md`** → gambaran umum proyek, stack, scope, roadmap.
+* **`system_requirement.md`** → arsitektur sistem, modul, integrasi, scheduler.
+* **`data_process_requirement.md`** → aturan proses data (import, mapping, validation, audit).
+* **`report_requirement.md`** → kebutuhan output laporan harian, mingguan, bulanan, tahunan.
+* **`database.txt`** → rancangan tabel & struktur DB (pakai raw SQL, optimized untuk recon).
+
+📌 **Rule:**
+Jika perlu membuat query SQL atau rincian tabel → gunakan **`database.txt`**.
+Jika perlu menjelaskan proses → gunakan **`data_process_requirement.md`**.
+Jika perlu membuat flow arsitektur → gunakan **`system_requirement.md`**.
+Jika perlu menjabarkan stack & rencana sprint → gunakan **`project_requirement.md`**.
+Jika perlu format laporan → gunakan **`report_requirement.md`**.
+
+---
+
+## 3. Business Principles (Core)
+
+* **Source of truth**: POS/BI.
+* **Settlement Rule**: `Nett = Gross − Fee − Ads` (− QPON jika ada laporan).
+* **Bank Check**: Nett Sales(T) = Bank In(T+N).
+* **Zero tolerance**: Selisih tanpa alasan tidak boleh.
+* **Reason codes** wajib (`BANK_T_DELAY`, `FEE_VARIANCE`, `QPON_PROMO`, `ROUNDING`, `UNMAPPED_CHANNEL`).
+* **Auditability**: Semua proses tersimpan dengan evidence (file, email, bank).
+
+---
+
+## 4. AI Usage Guideline
+
+* AI **tidak langsung commit data** → hanya membantu validasi, mapping suggestion, atau anomali detection.
+* Default mode: **rule-based deterministik**.
+* Semua output AI → preview/exception → harus di-review user.
+* Jangan load semua dokumen sekaligus, cukup panggil dokumen sesuai kebutuhan (lihat §2).
+
+---
+
+## 5. Acceptance Criteria
+
+* 100% transaksi masuk sistem.
+* Semua batch status = `MATCHED` atau `EXCEPTION`.
+* Laporan tersedia on-time: Harian T+1 07:00 WIB.
+* Selisih ≤ 0 kecuali ada reason code.
+* Semua posting ke Accurate sukses / tercatat di exception queue.
+
+---
+
+📌 Dengan struktur ini, AI/tim hanya baca `requirement.md` dulu → lalu navigasi ke file lain sesuai kebutuhan.
+
+---
+
+Apakah mau saya buatkan juga contoh **alur kerja untuk AI** (semacam flow: “kalau user minta query → buka database.txt, kalau minta laporan → buka report\_requirement.md”), supaya jadi semacam SOP mini?
