@@ -1,0 +1,30 @@
+[90m= [39m[
+    [
+      "[34mline_no[39m" => "[32m1[39m",
+      "[34mproduct_code[39m" => "[32mABC001[39m",
+      "[34mproduct_name[39m" => "[32mProduct A[39m",
+      "[34mprice_incl_tax[39m" => [33m15000.0[39m,
+      "[34mqty[39m" => [33m10.0[39m,
+      "[34muom[39m" => "[32mPCS[39m",
+      "[34mamt_incl_tax[39m" => [33m150000.0[39m,
+    ],
+    [
+      "[34mline_no[39m" => "[32m2[39m",
+      "[34mproduct_code[39m" => "[32mABC002[39m",
+      "[34mproduct_name[39m" => "[32mProduct B[39m",
+      "[34mprice_incl_tax[39m" => [33m25000.0[39m,
+      "[34mqty[39m" => [33m5.0[39m,
+      "[34muom[39m" => "[32mPCS[39m",
+      "[34mamt_incl_tax[39m" => [33m125000.0[39m,
+    ],
+    [
+      "[34mline_no[39m" => "[32m3[39m",
+      "[34mproduct_code[39m" => "[32mABC003[39m",
+      "[34mproduct_name[39m" => "[32mProduct C[39m",
+      "[34mprice_incl_tax[39m" => [33m35000.0[39m,
+      "[34mqty[39m" => [33m8.0[39m,
+      "[34muom[39m" => "[32mPCS[39m",
+      "[34mamt_incl_tax[39m" => [33m280000.0[39m,
+    ],
+  ]
+
